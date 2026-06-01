@@ -295,9 +295,17 @@ public class OptimizeMixedDistinctAggregations
 
             // 1. Add GroupIdNode
             VariableReferenceExpression groupVariable = variableAllocator.newVariable("group", BIGINT); // g
+            // Identify non-distinct aggregate args whose values are constant (not derived from table
+            // columns). These must appear in both grouping sets so GroupIdNode never NULLs them out.
+            // If a constant arg (e.g. the percentile in approx_percentile) is absent from g1,
+            // Velox sees inconsistent values across a batch and throws:
+            // "Percentile argument must be constant for all input rows" (Issue #27860).
+            Set<VariableReferenceExpression> constantNonDistinctArgs =
+                    findConstantNonDistinctArgs(nonDistinctAggregateVariables, source);
             GroupIdNode groupIdNode = createGroupIdNode(
                     groupByVariables,
                     nonDistinctAggregateVariables,
+                    constantNonDistinctArgs,
                     distinctVariable,
                     duplicatedDistinctVariable,
                     groupVariable,
@@ -423,6 +431,7 @@ public class OptimizeMixedDistinctAggregations
         private GroupIdNode createGroupIdNode(
                 List<VariableReferenceExpression> groupByVariables,
                 List<VariableReferenceExpression> nonDistinctAggregateVariables,
+                Set<VariableReferenceExpression> constantNonDistinctArgs,
                 VariableReferenceExpression distinctVariable,
                 VariableReferenceExpression duplicatedDistinctVariable,
                 VariableReferenceExpression groupVariable,
@@ -431,7 +440,7 @@ public class OptimizeMixedDistinctAggregations
         {
             List<List<VariableReferenceExpression>> groups = new ArrayList<>();
             // g0 = {group-by symbols + allNonDistinctAggregateSymbols}
-            // g1 = {group-by symbols + Distinct Symbol}
+            // g1 = {group-by symbols + Distinct Symbol + constantNonDistinctArgs}
             // symbols present in Group_i will be set, rest will be Null
 
             //g0
@@ -440,9 +449,11 @@ public class OptimizeMixedDistinctAggregations
             group0.addAll(nonDistinctAggregateVariables);
             groups.add(ImmutableList.copyOf(group0));
 
-            // g1
+            // g1: also include constant non-distinct args (e.g. the percentile parameter in
+            // approx_percentile) so GroupIdNode never NULLs them out for g1 rows.
             Set<VariableReferenceExpression> group1 = new HashSet<>(groupByVariables);
             group1.add(distinctVariable);
+            group1.addAll(constantNonDistinctArgs);
             groups.add(ImmutableList.copyOf(group1));
 
             return new GroupIdNode(
@@ -537,6 +548,56 @@ public class OptimizeMixedDistinctAggregations
                 }
             }
             return builder.build();
+        }
+
+        // Returns the subset of nonDistinctAggregateVariables whose values are constant expressions
+        // (i.e. their defining projection contains no VariableReferenceExpression). These variables
+        // must be included in both grouping sets of the GroupIdNode so they are never NULLed out.
+        private static Set<VariableReferenceExpression> findConstantNonDistinctArgs(
+                List<VariableReferenceExpression> nonDistinctAggregateVariables,
+                PlanNode source)
+        {
+            ImmutableSet.Builder<VariableReferenceExpression> constantArgs = ImmutableSet.builder();
+            for (VariableReferenceExpression variable : nonDistinctAggregateVariables) {
+                if (isDefinedAsConstant(variable, source)) {
+                    constantArgs.add(variable);
+                }
+            }
+            return constantArgs.build();
+        }
+
+        // Returns true if the variable is defined by a projection that contains no column references,
+        // meaning its value is the same for every input row (it is a computed constant).
+        private static boolean isDefinedAsConstant(VariableReferenceExpression variable, PlanNode node)
+        {
+            if (node instanceof ProjectNode) {
+                RowExpression expression = ((ProjectNode) node).getAssignments().get(variable);
+                if (expression != null) {
+                    return !containsVariableReference(expression);
+                }
+            }
+            for (PlanNode source : node.getSources()) {
+                if (isDefinedAsConstant(variable, source)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static boolean containsVariableReference(RowExpression expression)
+        {
+            if (expression instanceof VariableReferenceExpression) {
+                return true;
+            }
+            if (expression instanceof CallExpression) {
+                return ((CallExpression) expression).getArguments().stream()
+                        .anyMatch(arg -> containsVariableReference(arg));
+            }
+            if (expression instanceof SpecialFormExpression) {
+                return ((SpecialFormExpression) expression).getArguments().stream()
+                        .anyMatch(arg -> containsVariableReference(arg));
+            }
+            return false;
         }
     }
 
