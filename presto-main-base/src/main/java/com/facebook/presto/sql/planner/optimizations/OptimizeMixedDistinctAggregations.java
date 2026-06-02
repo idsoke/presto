@@ -40,6 +40,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -557,31 +558,34 @@ public class OptimizeMixedDistinctAggregations
                 List<VariableReferenceExpression> nonDistinctAggregateVariables,
                 PlanNode source)
         {
+            Map<VariableReferenceExpression, RowExpression> allAssignments = collectProjectAssignments(source);
             ImmutableSet.Builder<VariableReferenceExpression> constantArgs = ImmutableSet.builder();
             for (VariableReferenceExpression variable : nonDistinctAggregateVariables) {
-                if (isDefinedAsConstant(variable, source)) {
+                RowExpression expression = allAssignments.get(variable);
+                if (expression != null && !containsVariableReference(expression)) {
                     constantArgs.add(variable);
                 }
             }
             return constantArgs.build();
         }
 
-        // Returns true if the variable is defined by a projection that contains no column references,
-        // meaning its value is the same for every input row (it is a computed constant).
-        private static boolean isDefinedAsConstant(VariableReferenceExpression variable, PlanNode node)
+        // Traverses the plan subtree once and collects all ProjectNode variable→expression assignments.
+        // This avoids repeated full-tree scans when checking multiple variables.
+        private static Map<VariableReferenceExpression, RowExpression> collectProjectAssignments(PlanNode node)
+        {
+            Map<VariableReferenceExpression, RowExpression> assignments = new HashMap<>();
+            collectProjectAssignmentsHelper(node, assignments);
+            return assignments;
+        }
+
+        private static void collectProjectAssignmentsHelper(PlanNode node, Map<VariableReferenceExpression, RowExpression> assignments)
         {
             if (node instanceof ProjectNode) {
-                RowExpression expression = ((ProjectNode) node).getAssignments().get(variable);
-                if (expression != null) {
-                    return !containsVariableReference(expression);
-                }
+                assignments.putAll(((ProjectNode) node).getAssignments().getMap());
             }
-            for (PlanNode source : node.getSources()) {
-                if (isDefinedAsConstant(variable, source)) {
-                    return true;
-                }
+            for (PlanNode child : node.getSources()) {
+                collectProjectAssignmentsHelper(child, assignments);
             }
-            return false;
         }
 
         private static boolean containsVariableReference(RowExpression expression)

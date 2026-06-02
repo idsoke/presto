@@ -14,12 +14,14 @@
  */
 package com.facebook.presto.nativetests;
 
+import com.facebook.presto.Session;
 import com.facebook.presto.testing.QueryRunner;
 import com.google.common.collect.ImmutableMap;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
+import static com.facebook.presto.SystemSessionProperties.OPTIMIZE_DISTINCT_AGGREGATIONS;
 import static com.facebook.presto.nativeworker.PrestoNativeQueryRunnerUtils.nativeHiveQueryRunnerBuilder;
 import static com.facebook.presto.sidecar.NativeSidecarPluginQueryRunnerUtils.setupNativeSidecarPlugin;
 import static java.lang.Boolean.parseBoolean;
@@ -71,23 +73,19 @@ public class TestOptimizeMixedDistinctAggregations
     @Test
     public void testIssue27860ApproxPercentileWithComputedConstantAndDistinct()
     {
-        // Issue #27860: when optimize_mixed_distinct_aggregations=true, combining
-        // approx_percentile with a computed constant percentile (e.g. CAST(90 AS DOUBLE)/100)
-        // and COUNT(DISTINCT ...) causes Velox to throw because the optimizer's GroupIdNode
-        // NULLs out the percentile variable for grouping-set-1 rows.
-        // Velox sees percentile=0.9 for g0 rows and percentile=0 (NULL coerced) for g1 rows
-        // within the same batch, violating its constant-percentile invariant.
-        //
-        // Expected error (bug present):
-        //   "Percentile argument must be constant for all input rows"
-        //
-        // This test PASSES while the bug exists and must be changed to assertQuerySucceeds after fix.
+        // Issue #27860: approx_percentile with a computed constant percentile (e.g. CAST(90 AS DOUBLE)/100)
+        // combined with COUNT(DISTINCT ...) must succeed when optimize_mixed_distinct_aggregations=true.
+        // The fix ensures the constant percentile variable is included in both GroupIdNode grouping sets
+        // so Velox never sees a NULL value for it, satisfying its constant-percentile invariant.
         @Language("SQL") String sql =
                 "SELECT approx_percentile(CAST(totalprice AS BIGINT), CAST(90 AS DOUBLE) / 100)," +
                 "       count(distinct custkey) " +
                 "FROM orders " +
                 "GROUP BY orderstatus";
 
-        assertQueryFails(sql, ".*Percentile argument must be constant for all input rows.*", true);
+        Session session = Session.builder(getSession())
+                .setSystemProperty(OPTIMIZE_DISTINCT_AGGREGATIONS, "true")
+                .build();
+        assertQuerySucceeds(session, sql);
     }
 }
